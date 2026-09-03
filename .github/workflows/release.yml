@@ -1,0 +1,148 @@
+name: Release
+
+# Ships the transport's image whenever the "version" field in package.json
+# changes on main. Bump it locally (`npm version patch --no-git-tag-version`),
+# commit and push; this workflow verifies, pushes
+# ghcr.io/<owner>/ahw-transport-discord on that version, moves :latest, and
+# tags the commit. No version change -> nothing runs. Manual dispatch (Actions
+# -> Release -> Run workflow) forces a release of the CURRENT version, for
+# re-runs and for proving the pipeline on a fresh repo; every step is
+# idempotent.
+#
+# Auth everywhere is the job's own GITHUB_TOKEN — no registry secrets to keep. It
+# authenticates three things: the SDK install (GitHub Packages wants a token
+# even for a public package), the image push, and the tag.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Detect version change
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Need the previous commit to diff the version field.
+          fetch-depth: 2
+
+      - id: check
+        name: Compare package.json version against previous commit
+        run: |
+          set -eu
+          current=$(node -p "require('./package.json').version")
+          echo "version=$current" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch -> releasing current version $current."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git cat-file -e HEAD~1:package.json 2>/dev/null; then
+            previous=$(git show HEAD~1:package.json \
+              | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          else
+            previous=""
+          fi
+          echo "previous='$previous' current='$current'"
+          if [ "$current" != "$previous" ]; then
+            echo "Version changed -> release will run."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged -> nothing to release."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  verify:
+    name: Typecheck and test
+    needs: version
+    if: needs.version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reading the SDK from GitHub Packages. Stated rather than inherited:
+      # a repository whose default workflow permissions are restricted gets
+      # `contents: read` and nothing else, and the install would 401 on a
+      # package that is public.
+      packages: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          # The SDK's scope lives on GitHub Packages; NODE_AUTH_TOKEN below
+          # authenticates the install (that registry wants a token even for a
+          # public package).
+          registry-url: https://npm.pkg.github.com
+          scope: "@assistant-hub-swarm"
+          cache: npm
+      # See the Dockerfile on npm install vs npm ci.
+      - run: npm install --no-audit --no-fund
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: npm run typecheck
+      - run: npm run test
+
+  publish:
+    name: Build, push and tag
+    needs: [version, verify]
+    if: needs.version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # Push the release tag back to the repo.
+      contents: write
+      # Push the image to the org's container registry.
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/ahw-transport-discord
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The version tag and :latest go up together: one image, one push, so
+      # there is no window where :latest points at something :version does not.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          # The Dockerfile installs the SDK from GitHub Packages; the token
+          # rides in as a BuildKit secret so it never lands in a layer.
+          secrets: |
+            npm_token=${{ secrets.GITHUB_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Last: the tag exists only for a version that is in the registry.
+      - name: Create and push release tag
+        run: |
+          tag="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists on origin, skipping tag creation."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Release $tag"
+            git push origin "$tag"
+          fi

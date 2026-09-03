@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+*.tsbuildinfo
+.DS_Store
+npm-debug.log*
