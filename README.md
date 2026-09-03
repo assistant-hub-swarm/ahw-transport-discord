@@ -85,50 +85,40 @@ that comes from the core at registration and on every change.
 
 ## What lives where
 
-The folders follow the **direction of travel**, which is how the contract
-itself reads. `discord/` is the only part that knows the Discord API exists.
+Almost nothing. Registration, reconcile, deduping, event assembly, the sends,
+the HTTP surface, the delivery tools and shutdown are all the SDK's transport
+runtime — the same for every platform, so they live in one place. What is here
+is Discord, and the boundary is the folder: `discord/` is the only code that
+knows the Discord API exists.
 
 ```
 src/
-  index.ts              boot order, shutdown
-
-  core/                 everything that speaks to the core
-    desired-state.ts    registration, the desired state, the retry
-    updates.ts          the update queue: publisher, envelope, seen-cache
-    client.ts           the synchronous calls back (menu press, mirror lookup)
-
-  inbound/              Discord -> core
-    normalize.ts        one gateway message becomes one transport event
-    addressing.ts       the structural verdict, per receiving bot
-
-  outbound/             core -> Discord
-    delivery.ts         the bus consumer: reply delivery, typing, deliver trace
-    send.ts             the one send: split, send each part, report each
-    split.ts            cutting under Discord's 2000-character cap
+  index.ts              the four pieces, handed to startTransportService
+  descriptor.ts         who this transport is: id, name, config fields, limits
 
   discord/              the only code that knows the Discord API
-    manager.ts          gateway clients, reconcile, intents, event handlers
-    connections.ts      the running-connection roster
-    sender.ts           the platform sends (text, files, menus, reactions)
+    adapter.ts          gateway clients, intents, what each event means
+    connection.ts       the platform actions (text, files, menus, reactions)
+    reaction-tool.ts    the reaction MCP tool
     ids.ts              snowflakes, citation links, mention stripping
-    media/ingest.ts     attachments and stickers, fetched and normalized
+    media.ts            attachments and stickers, fetched and normalized
 
-  http/                 this service's own surface
-    api.ts              /health and /internal/*
-    mcp.ts              /mcp: the tools and the turn binding
+  inbound/              reading a gateway message into the contract
+    normalize.ts        one Discord message becomes one InboundMessage
+    addressing.ts       the structural verdict, per receiving bot
 ```
 
 Tests sit beside what they cover.
 
 ## Where Discord differs from Telegram
 
-Both implement the same contract; almost everything that differs is confined
-to `discord/`. The parts worth knowing:
+Both are the same runtime with a different platform under it, so everything
+that differs is in `discord/` and `inbound/`. The parts worth knowing:
 
 | | |
 | --- | --- |
 | **Ids are snowflakes** | 64-bit, and `Number()` corrupts them. The wire keeps every id a string for exactly this reason, so nothing here parses one |
-| **2000 characters, not 4096** | Long replies split far more often, which is why the boundaries in `split.ts` matter rather than a blunt slice |
+| **2000 characters, not 4096** | Long replies split far more often. The cap is a number in the descriptor; the splitting itself is the runtime's, so both transports cut the same way |
 | **Mentions are structured** | `<@id>`, not a name to match — so the structural check is exact, with no case folding to get wrong. A role or `@everyone` ping is deliberately *not* addressing |
 | **No voice bubble** | The core's voice reply arrives as audio plus its spoken text; this transport sends the audio as an attachment and reports `asVoice: false` rather than claiming a form the platform lacks |
 | **Menus are buttons** | The feedback flow's 👍/👎 menu is an action row, and a press is an interaction that must be answered within three seconds — so the toast comes back as an ephemeral reply |
@@ -153,8 +143,9 @@ version and tags the commit.
 
 ## The contract
 
-Everything that crosses the boundary comes from the [SDK][sdk]. Two versions
-matter, and they are different numbers: this repository's own version is what
+Everything that crosses the boundary comes from the [SDK][sdk], and so does
+the runtime this service is a few hundred lines of platform code on top of.
+Two versions matter, and they are different numbers: this repository's own version is what
 its image is tagged with, and `CONTRACT_MAJOR` — exported by the SDK — is the
 **wire** major, announced at registration. A core that speaks another major
 refuses this transport by name, with a reason its dashboard shows.
