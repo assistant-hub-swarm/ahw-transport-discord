@@ -66,9 +66,27 @@ In the [Discord Developer Portal](https://discord.com/developers/applications):
    Without it the bot connects, looks healthy, and receives every message with
    an empty body — the single most common way this transport appears broken
    when it is merely unconfigured.
-3. **OAuth2 → URL Generator**: scope `bot`, permissions *View Channels*, *Send
-   Messages*, *Read Message History*, *Add Reactions*, *Attach Files*. Open the
-   generated URL to invite it to a server. DMs need no invitation.
+3. **OAuth2 → URL Generator**: scope `bot`, and the permissions below. Open the
+   generated URL to invite it to a server. DMs need no invitation, and need no
+   permissions at all.
+
+   | Permission | Why the transport needs it |
+   | --- | --- |
+   | View Channels | Resolving a channel by id at all |
+   | Send Messages | Replies, standalone sends, feedback menus, the typing indicator |
+   | Send Messages in Threads | The same, when the channel is a thread |
+   | Read Message History | Fetching a message to react to, resolving a reply's target, hydrating a reaction on a message older than the process |
+   | Add Reactions | The `set_message_reaction` tool |
+   | Attach Files | Voice replies, generated images, browser-run downloads |
+
+   Permissions integer **274878008384**. Two more are worth granting but not
+   required: **Embed Links** (a URL in a reply renders a preview) and **Use
+   External Emojis** (a reaction may use a custom emoji from another server) —
+   with both, the integer is **274878286912**.
+
+   It does **not** need *Manage Messages* or *Administrator*. It only ever
+   deletes its own messages and clears its own reactions, and neither takes a
+   permission. Granting Manage Messages would let it delete other people's.
 
 ## Environment
 

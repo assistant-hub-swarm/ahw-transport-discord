@@ -27,10 +27,20 @@ export const descriptor: TransportDescriptor = {
       label: "Bot token",
       kind: "secret",
       required: true,
+      // Two different things, and only one of them was here before: the
+      // INTENT decides what Discord sends the bot, the PERMISSIONS decide what
+      // it may do in a server. Under-granting either produces a bot that
+      // connects, reports healthy, and silently does nothing — so both are
+      // named, with the integer to paste and the two nobody should grant.
       help:
         "From the Discord Developer Portal → your application → Bot → Reset Token. " +
-        "The bot needs the MESSAGE CONTENT intent enabled on that page, or it will " +
-        "connect and see every message as empty. Stored by the core; never shown again.",
+        "On that page also enable the MESSAGE CONTENT intent, or the bot connects, " +
+        "looks healthy, and sees every message as empty. Invite it with OAuth2 → URL " +
+        "Generator (scope: bot) granting View Channels, Send Messages, Send Messages " +
+        "in Threads, Read Message History, Add Reactions and Attach Files — " +
+        "permissions integer 274878008384. It never needs Manage Messages or " +
+        "Administrator: it only ever deletes its own messages and clears its own " +
+        "reactions. Stored by the core; never shown again.",
     },
   ],
   // Nothing is configured per transport: owner rights, personas and tasks all
