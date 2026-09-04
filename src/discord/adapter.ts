@@ -82,6 +82,7 @@ export const discordAdapter: PlatformAdapter<Message> = {
 
     const client = new Client({ intents: INTENTS, partials: PARTIALS });
     const connection = createDiscordConnection({
+      isReady: () => client.isReady(),
       requireClient: () => {
         if (!client.isReady()) throw new Error("the Discord connection is not ready");
         return client;

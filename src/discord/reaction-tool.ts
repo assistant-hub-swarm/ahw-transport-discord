@@ -1,6 +1,7 @@
 import {
   reactToMessage,
   toolRefusal,
+  tracedTool,
   turnOf,
   type TransportRuntime,
 } from "@assistant-hub-swarm/transport-sdk";
@@ -56,54 +57,77 @@ export function registerReactionTool(server: McpServer, runtime: TransportRuntim
     },
     async ({ message_id, emoji }, extra) => {
       const turn = turnOf(extra?._meta, runtime.descriptor.id);
-      if (!turn) {
-        return toolRefusal(
-          "This tool can only be used inside a turn on Discord, and this call carries no turn " +
-            "binding. Nothing was changed.",
-        );
-      }
-      const reaction = emoji.trim() || null;
+      return tracedTool(
+        {
+          traces: runtime.traces,
+          descriptor: runtime.descriptor,
+          turn,
+          action: "set_message_reaction",
+          inputSummary: `${message_id} ${emoji || "(cleared)"}`,
+        },
+        async (event) => {
+          if (!turn) {
+            return toolRefusal(
+              "This tool can only be used inside a turn on Discord, and this call carries no turn " +
+                "binding. Nothing was changed.",
+            );
+          }
+          const reaction = emoji.trim() || null;
 
-      let outcome;
-      try {
-        outcome = await reactToMessage(
-          { ...runtime.send, core: runtime.core },
-          {
-            chatId: turn.chatId,
-            sourceMessageId: message_id,
-            emoji: reaction,
-            assistantId: turn.assistantId ?? null,
-          },
-        );
-      } catch (err) {
-        // Discord refused for a reason only it knows (an emoji this server
-        // does not have, a message too old, no running connection) — relayed
-        // verbatim so the model does not claim it reacted.
-        return toolRefusal(
-          `Discord did not accept the reaction: ${discordErrorText(err)}. ` +
-            "Do not claim you reacted.",
-        );
-      }
+          let outcome;
+          try {
+            outcome = await reactToMessage(
+              { ...runtime.send, core: runtime.core },
+              {
+                chatId: turn.chatId,
+                sourceMessageId: message_id,
+                emoji: reaction,
+                assistantId: turn.assistantId ?? null,
+              },
+            );
+          } catch (err) {
+            // Discord refused for a reason only it knows (an emoji this server
+            // does not have, a message too old, no running connection) — relayed
+            // verbatim so the model does not claim it reacted.
+            return toolRefusal(
+              `Discord did not accept the reaction: ${discordErrorText(err)}. ` +
+                "Do not claim you reacted.",
+            );
+          }
 
-      if (outcome.status === "not_found") {
-        return toolRefusal(
-          `No message ${message_id} in this channel. Do not guess ids — look the message up ` +
-            "again and use an id from the result, or answer without reacting.",
-        );
-      }
-      if (outcome.status === "own_message") {
-        return toolRefusal(
-          `Message ${message_id} is your own — do not react to what you said yourself. ` +
-            "React to someone else's message, or say what you mean in your answer.",
-        );
-      }
+          if (outcome.status === "not_found") {
+            return toolRefusal(
+              `No message ${message_id} in this channel. Do not guess ids — look the message up ` +
+                "again and use an id from the result, or answer without reacting.",
+            );
+          }
+          if (outcome.status === "own_message") {
+            return toolRefusal(
+              `Message ${message_id} is your own — do not react to what you said yourself. ` +
+                "React to someone else's message, or say what you mean in your answer.",
+            );
+          }
 
-      // Whether the bot will *remember* reacting: the mirror renders it on
-      // the target line; without that record the very next turn denies having
-      // set it. The reaction IS on the message either way.
-      const note = outcome.recorded
-        ? ""
-        : " (Warning: the reaction could not be recorded in your history — later turns may not remember it.)";
+          // Whether the bot will *remember* reacting: the mirror renders it on
+          // the target line; without that record the very next turn denies having
+          // set it. The reaction IS on the message either way.
+          const note = outcome.recorded
+            ? ""
+            : " (Warning: the reaction could not be recorded in your history — later turns may not remember it.)";
+          event({
+            message: reaction
+              ? `reacted ${reaction}`
+              : "reaction cleared",
+            type: "external_call",
+            level: outcome.recorded ? "success" : "warn",
+            data: {
+              sourceMessageId: message_id,
+              emoji: reaction,
+              // False means the badge is on the message but the core's mirror
+              // does not know, so the next turn will not remember reacting.
+              recorded: outcome.recorded,
+        },
+      });
       return {
         content: [
           {
@@ -117,6 +141,8 @@ export function registerReactionTool(server: McpServer, runtime: TransportRuntim
         ],
         structuredContent: { ok: true, message_id, emoji: reaction },
       };
+        },
+      );
     },
   );
 }

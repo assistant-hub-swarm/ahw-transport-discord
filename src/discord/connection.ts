@@ -60,10 +60,12 @@ const NO_PINGS = { parse: [] as never[], repliedUser: false };
 export function createDiscordConnection(input: {
   /** The live client, or a throw explaining why there is none. */
   requireClient: () => Client<true>;
+  /** Whether the gateway handshake has completed. */
+  isReady: () => boolean;
   /** Called on shutdown; the adapter owns the client's lifetime. */
   destroy: () => Promise<void>;
 }): PlatformConnection {
-  const { requireClient } = input;
+  const { requireClient, isReady } = input;
 
   async function channelOf(channelId: string): Promise<TextBasedChannel> {
     const channel = await requireClient().channels.fetch(channelId);
@@ -106,6 +108,10 @@ export function createDiscordConnection(input: {
 
   return {
     identity(): BotIdentity | null {
+      // Null, not a throw: `login()` resolves when the token is accepted and
+      // `ClientReady` fires later, so "no identity yet" is an ordinary state
+      // this method's own type already describes.
+      if (!isReady()) return null;
       const client = requireClient();
       return client.user
         ? {
