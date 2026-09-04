@@ -14,7 +14,13 @@ export const normalizeMessage: Normalizer<Message> = async (
 ): Promise<InboundMessage | null> => {
   const direct = message.channel.isDMBased();
   const note = attachmentNote(message);
-  const text = [message.content, note].filter(Boolean).join(" ").trim();
+  // `cleanContent`, not `content`: Discord puts mentions on the wire as
+  // `<@1545468913393860950>`, and that snowflake is what the core mirrors,
+  // indexes and shows the model — which reads it as noise, because it is.
+  // discord.js resolves the same tokens to the readable `@name` a person sees
+  // in the client. Outgoing text already strips raw mention tokens for the
+  // same reason; this is that rule on the way in.
+  const text = [message.cleanContent, note].filter(Boolean).join(" ").trim();
   const hasMedia = message.attachments.size > 0 || message.stickers.size > 0;
   if (!text && !hasMedia) return null;
 
@@ -47,7 +53,7 @@ export const normalizeMessage: Normalizer<Message> = async (
       ? {
           sourceMessageId: replied.id,
           hasMedia: replied.attachments.size > 0 || replied.stickers.size > 0,
-          text: replied.content || null,
+          text: replied.cleanContent || null,
           quote: null,
           author:
             replyAuthor && !replyAuthor.bot
