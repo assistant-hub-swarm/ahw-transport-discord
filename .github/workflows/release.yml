@@ -1,71 +1,110 @@
 name: Release
 
-# Ships the transport's image whenever the "version" field in package.json
-# changes on main. Bump it locally (`npm version patch --no-git-tag-version`),
-# commit and push; this workflow verifies, pushes
-# ghcr.io/<owner>/ahw-transport-discord on that version, moves :latest, and
-# tags the commit. No version change -> nothing runs. Manual dispatch (Actions
-# -> Release -> Run workflow) forces a release of the CURRENT version, for
-# re-runs and for proving the pipeline on a fresh repo; every step is
-# idempotent.
+# Ships this transport's image to the org's GitHub Container Registry as
+# ghcr.io/<owner>/ahw-transport-discord, moves :latest, and tags the commit.
 #
-# Auth everywhere is the job's own GITHUB_TOKEN — no registry secrets to keep. It
-# authenticates three things: the SDK install (GitHub Packages wants a token
+# THE GATE IS THE REGISTRY, NOT THE DIFF. A package.json version that changed
+# on this push says nothing about whether anything shipped: a release that
+# failed half-way leaves the manifest untouched, so a "did the version change?"
+# check would never retry it. This workflow asks what is actually released —
+# is this image tag in GHCR, is the git tag on origin — and ships only what is
+# missing. Any later push to main finishes an interrupted release, and a
+# version already in the registry is never rebuilt over.
+#
+# It also checks what it released. The built image has to BOOT — against a real
+# Redis, answering /health — before it is pushed anywhere, and the pushed
+# digest is read back from the registry with :latest checked to point at the
+# same one. A Dockerfile that builds but cannot start is the failure a build
+# alone does not catch, and it is the one an operator meets first.
+#
+# Releasing: bump `version` in package.json (`npm version patch
+# --no-git-tag-version`), commit, push. Manual dispatch (Actions -> Release ->
+# Run workflow) forces a release of the CURRENT version even when it is already
+# published — the deliberate escape hatch for replacing a bad build.
+#
+# Auth everywhere is the job's own GITHUB_TOKEN — no registry secrets to keep.
+# It authenticates three things: the SDK install (GitHub Packages wants a token
 # even for a public package), the image push, and the tag.
 on:
   push:
     branches: [main]
-    paths:
-      - "package.json"
   workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Workflow-level env is the one place `github` context and shell variables
+# meet: every step below gets these both as ${{ env.X }} and as $X.
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ahw-transport-discord
+  # The port the image serves on; the smoke test probes it.
+  APP_PORT: "3220"
+
 jobs:
-  version:
-    name: Detect version change
+  plan:
+    name: What is not released yet
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reading the container registry to find out what is already there.
+      packages: read
     outputs:
-      changed: ${{ steps.check.outputs.changed }}
-      version: ${{ steps.check.outputs.version }}
+      version: ${{ steps.plan.outputs.version }}
+      image_pending: ${{ steps.plan.outputs.image_pending }}
+      tag_pending: ${{ steps.plan.outputs.tag_pending }}
+      anything: ${{ steps.plan.outputs.anything }}
     steps:
       - uses: actions/checkout@v5
-        with:
-          # Need the previous commit to diff the version field.
-          fetch-depth: 2
 
-      - id: check
-        name: Compare package.json version against previous commit
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: plan
+        name: Ask the registry what exists
+        env:
+          FORCED: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           set -eu
-          current=$(node -p "require('./package.json').version")
-          echo "version=$current" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual dispatch -> releasing current version $current."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git cat-file -e HEAD~1:package.json 2>/dev/null; then
-            previous=$(git show HEAD~1:package.json \
-              | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCED" != "true" ] && docker buildx imagetools inspect "$IMAGE:$version" >/dev/null 2>&1; then
+            echo "$IMAGE:$version is already in the registry."
+            image_pending=false
           else
-            previous=""
+            echo "$IMAGE:$version is not released -> build and push it."
+            image_pending=true
           fi
-          echo "previous='$previous' current='$current'"
-          if [ "$current" != "$previous" ]; then
-            echo "Version changed -> release will run."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "image_pending=$image_pending" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "tag v$version is already on origin."
+            tag_pending=false
           else
-            echo "Version unchanged -> nothing to release."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "tag v$version is missing."
+            tag_pending=true
+          fi
+          echo "tag_pending=$tag_pending" >> "$GITHUB_OUTPUT"
+
+          if [ "$image_pending$tag_pending" = "falsefalse" ]; then
+            echo "Version $version is already released; nothing to do."
+            echo "anything=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "anything=true" >> "$GITHUB_OUTPUT"
           fi
 
   verify:
     name: Typecheck and test
-    needs: version
-    if: needs.version.outputs.changed == 'true'
+    needs: plan
+    # A missing git tag counts: a commit is not marked released until it has
+    # passed.
+    if: needs.plan.outputs.anything == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -93,9 +132,9 @@ jobs:
       - run: npm run test
 
   publish:
-    name: Build, push and tag
-    needs: [version, verify]
-    if: needs.version.outputs.changed == 'true'
+    name: Build, boot, push and tag
+    needs: [plan, verify]
+    if: needs.plan.outputs.anything == 'true'
     runs-on: ubuntu-latest
     permissions:
       # Push the release tag back to the repo.
@@ -103,12 +142,76 @@ jobs:
       # Push the image to the org's container registry.
       packages: write
     env:
-      VERSION: ${{ needs.version.outputs.version }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/ahw-transport-discord
+      VERSION: ${{ needs.plan.outputs.version }}
+      PENDING: ${{ needs.plan.outputs.image_pending }}
+    # The smoke test below runs the real image against this. No core: the
+    # transport registers with one at boot and retries forever when there is
+    # none, which is exactly the state a freshly deployed transport is in — and
+    # /health has to answer through it, because the core probes /health to
+    # decide whether the transport is up at all.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
+
+      # Built and LOADED, not pushed: nothing reaches the registry until it has
+      # started and answered.
+      - name: Build image
+        if: env.PENDING == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          # The Dockerfile installs the SDK from GitHub Packages; the token
+          # rides in as a BuildKit secret so it never lands in a layer.
+          secrets: |
+            npm_token=${{ secrets.GITHUB_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot the image and probe /health
+        if: env.PENDING == 'true'
+        run: |
+          set -eu
+          docker run -d --name smoke --network host \
+            -e NODE_ENV=production \
+            -e PORT="$APP_PORT" \
+            -e REDIS_URL=redis://127.0.0.1:6379 \
+            -e INTERNAL_API_TOKEN=smoke-test \
+            "$IMAGE:$VERSION"
+          for _ in $(seq 1 30); do
+            if body=$(curl -fsS --max-time 5 "http://127.0.0.1:$APP_PORT/health" 2>/dev/null); then
+              echo "/health answered: $body"
+              # It must be the transport's own answer, not something else on
+              # the port.
+              echo "$body" | node -e "
+                const body = require('fs').readFileSync(0, 'utf8');
+                const parsed = JSON.parse(body);
+                if (parsed.ok !== true || !Array.isArray(parsed.connections)) {
+                  throw new Error('not a transport health body: ' + body);
+                }
+              "
+              docker rm -f smoke >/dev/null
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]; then
+              echo "::error::the container exited before it served /health"
+              docker logs smoke
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::/health never answered within 60s"
+          docker logs smoke
+          exit 1
 
       - name: Log in to the GitHub Container Registry
         uses: docker/login-action@v3
@@ -117,26 +220,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The version tag and :latest go up together: one image, one push, so
-      # there is no window where :latest points at something :version does not.
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ env.VERSION }}
-            ${{ env.IMAGE }}:latest
-          # The Dockerfile installs the SDK from GitHub Packages; the token
-          # rides in as a BuildKit secret so it never lands in a layer.
-          secrets: |
-            npm_token=${{ secrets.GITHUB_TOKEN }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # The version tag first, then :latest, so a failure between them can
+      # never leave :latest pointing at something :version does not.
+      - name: Push
+        if: env.PENDING == 'true'
+        run: |
+          set -eu
+          docker push "$IMAGE:$VERSION"
+          docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+          docker push "$IMAGE:latest"
 
-      # Last: the tag exists only for a version that is in the registry.
+      # Read back what the registry now holds, rather than trusting that the
+      # push said so.
+      - name: Verify what landed in the registry
+        if: env.PENDING == 'true'
+        run: |
+          set -eu
+          versioned=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+          latest=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')
+          echo "$IMAGE:$VERSION -> $versioned"
+          if [ "$versioned" != "$latest" ]; then
+            echo "::error::$IMAGE:latest is $latest, not the $VERSION digest $versioned"
+            exit 1
+          fi
+
+      # Last: the tag exists only for a version that is in the registry and
+      # started when it was run.
       - name: Create and push release tag
         run: |
+          set -eu
           tag="v${VERSION}"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
             echo "Tag $tag already exists on origin, skipping tag creation."
